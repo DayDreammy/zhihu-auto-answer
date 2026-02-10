@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# 数据文件
+zhihu_cookies.json
+processed_invitations.json
+qrcode.png
+*.log
+
+# 调试文件
+debug_*.html
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store

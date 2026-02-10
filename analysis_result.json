@@ -1,0 +1,30 @@
+{
+  "notifications_page": {
+    "selectors_tested": [
+      {
+        "selector": ".NotificationList-item",
+        "count": 0
+      },
+      {
+        "selector": "[class*=\"NotificationList\"] > div",
+        "count": 0
+      },
+      {
+        "selector": ".List-item",
+        "count": 0
+      },
+      {
+        "selector": ".ContentItem",
+        "count": 0
+      },
+      {
+        "selector": "div[role=\"listitem\"]",
+        "count": 0
+      }
+    ],
+    "items_found": 0,
+    "sample_items": []
+  },
+  "login_status": false,
+  "timestamp": "5168311.647725543"
+}

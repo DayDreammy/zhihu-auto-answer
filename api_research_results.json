@@ -1,0 +1,53 @@
+[
+  {
+    "url": "https://www.zhihu.com/api/v4/notifications",
+    "method": "GET",
+    "status": 404,
+    "content_type": "text/html; charset=UTF-8",
+    "error": "Not found"
+  },
+  {
+    "url": "https://www.zhihu.com/api/v4/notifications/v2",
+    "method": "GET",
+    "status": 404,
+    "content_type": "text/html; charset=UTF-8",
+    "error": "Not found"
+  },
+  {
+    "url": "https://www.zhihu.com/api/v4/messages",
+    "method": "GET",
+    "status": 200,
+    "content_type": "application/json",
+    "data": {
+      "msg": "success"
+    }
+  },
+  {
+    "url": "https://www.zhihu.com/api/v4/me",
+    "method": "GET",
+    "status": 401,
+    "content_type": "application/json",
+    "error": "Unauthorized"
+  },
+  {
+    "url": "https://www.zhihu.com/api/v4/me/invitations",
+    "method": "GET",
+    "status": 401,
+    "content_type": "application/json",
+    "error": "Unauthorized"
+  },
+  {
+    "url": "https://www.zhihu.com/api/v4/mine/invitations",
+    "method": "GET",
+    "status": 404,
+    "content_type": "text/html; charset=UTF-8",
+    "error": "Not found"
+  },
+  {
+    "url": "https://www.zhihu.com/api/v4/questions/invited",
+    "method": "GET",
+    "status": 404,
+    "content_type": "text/html; charset=UTF-8",
+    "error": "Not found"
+  }
+]
