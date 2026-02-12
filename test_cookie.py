@@ -1,67 +1,70 @@
 #!/usr/bin/env python3
 """
-快速测试 - 验证Cookie和基本功能
+Cookie/登录相关脚本 + 可选集成测试。
+
+注意：访问知乎需要有效 Cookie，且会触发网络请求/风控校验；
+默认 pytest 不跑集成测试，避免 CI/本地无 Cookie 时误报失败。
 """
+import os
 import sys
-sys.path.insert(0, '.')
+from pathlib import Path
 
-from zhihu_bot_v2 import ZhihuAutoAnswer
+import pytest
+
+sys.path.insert(0, ".")
 
 
-def test_cookie():
-    """测试Cookie是否有效"""
-    print("=" * 60)
-    print("知乎Cookie测试")
-    print("=" * 60)
-    
+def test_import_zhihu_bot_creates_logs_dir():
+    # 这是一个纯本地单元测试：保证核心模块可导入，且不会因为 logs/ 缺失而崩溃。
+    import zhihu_bot  # noqa: F401
+
+    assert Path("logs").exists()
+
+
+@pytest.mark.skipif(
+    os.environ.get("ZHIHU_INTEGRATION") != "1",
+    reason="requires network + valid zhihu cookies; set env ZHIHU_INTEGRATION=1 to enable",
+)
+def test_cookie_integration():
+    """集成测试：验证 Cookie 是否有效（需要提前准备 zhihu_cookies.json）。"""
+    from zhihu_bot_v2 import ZhihuAutoAnswer
+
     bot = ZhihuAutoAnswer()
-    
-    # 尝试加载Cookie
-    if not bot.load_cookies_from_file():
-        print("\n❌ 没有找到Cookie文件")
-        print("\n请使用以下方法之一提供Cookie:")
-        print("  1. 运行: python zhihu_bot_v2.py --login")
-        print("  2. 从浏览器导出Cookie到 zhihu_cookies.json")
-        print("  3. 使用: python test_cookie.py --cookie-string 'z_c0=xxx; xxx=xxx'")
-        return False
-    
-    # 测试登录
-    print("\n测试登录状态...")
-    if bot.check_login():
-        print("\n✅ Cookie有效！")
-        
-        # 测试获取邀请
-        print("\n测试获取邀请列表...")
-        invitations = bot.get_invitations()
-        
-        if invitations:
-            print(f"\n✅ 发现 {len(invitations)} 个新邀请:")
-            for inv in invitations:
-                print(f"  📌 {inv.question.title[:60]}...")
-        else:
-            print("\n📭 没有新的邀请（或所有邀请都已处理）")
-        
-        return True
-    else:
-        print("\n❌ Cookie已失效，请重新登录")
-        return False
+    assert bot.load_cookies_from_file(), "Cookie 文件不存在或无法解析"
+    assert bot.check_login(), "Cookie 无效或已过期"
 
 
-if __name__ == '__main__':
+def _cli():
+    from zhihu_bot_v2 import ZhihuAutoAnswer
+
     import argparse
-    
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cookie-string', help='从命令行提供Cookie字符串')
+    parser.add_argument("--cookie-string", help="从命令行提供Cookie字符串")
     args = parser.parse_args()
-    
+
+    bot = ZhihuAutoAnswer()
+
     if args.cookie_string:
-        bot = ZhihuAutoAnswer()
         bot.load_cookies_from_string(args.cookie_string)
-        if bot.check_login():
-            print("✅ Cookie有效！")
-            invitations = bot.get_invitations()
-            print(f"发现 {len(invitations)} 个邀请")
-        else:
-            print("❌ Cookie无效")
     else:
-        test_cookie()
+        if not bot.load_cookies_from_file():
+            print("❌ 没有找到 Cookie 文件: zhihu_cookies.json")
+            print("可选方案:")
+            print("  1) python main.py --login  (推荐，扫码保存 Playwright Cookie)")
+            print("  2) python zhihu_bot_v2.py --login")
+            print("  3) python test_cookie.py --cookie-string \"z_c0=...; d_c0=...\"")
+            return 2
+
+    if bot.check_login():
+        print("✅ Cookie 有效")
+        inv = bot.get_invitations()
+        print(f"邀请数: {len(inv)}")
+        return 0
+
+    print("❌ Cookie 无效/已过期")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

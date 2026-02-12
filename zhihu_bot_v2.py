@@ -172,54 +172,81 @@ class ZhihuAutoAnswer:
                 return invitations
             
             data = response.json()
-            
-            # 解析数据
+
+            # 处理风控/验证响应
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                err = data["error"]
+                code = err.get("code")
+                msg = err.get("message")
+                redirect = err.get("redirect")
+                print(f"❌ 获取邀请失败: code={code}, message={msg}")
+                if redirect:
+                    print(f"   需要先通过验证页面: {redirect}")
+                return invitations
+
+            # 解析 data（兼容 list / dict 多种结构）
+            items = []
             if isinstance(data, dict):
-                items = data.get('data', [])
-                
-                print(f"📊 获取到 {len(items)} 个邀请")
-                
-                for item in items:
-                    try:
-                        # 提取问题信息
-                        question_data = item.get('question', {})
-                        if not question_data:
-                            continue
-                        
-                        question_id = str(question_data.get('id', ''))
-                        title = question_data.get('title', '')
-                        
-                        if not question_id or not title:
-                            continue
-                        
-                        # 检查是否已处理
-                        if question_id in self.processed_ids:
-                            print(f"  ⏭️  跳过已处理: {title[:50]}...")
-                            continue
-                        
-                        question = Question(
-                            id=question_id,
-                            title=title,
-                            url=f"https://www.zhihu.com/question/{question_id}",
-                            content=question_data.get('detail', '')[:1000]
-                        )
-                        
-                        invitation = Invitation(
-                            question=question,
-                            inviter=item.get('sender', {}).get('name')
-                        )
-                        
-                        invitations.append(invitation)
-                        print(f"  📌 新邀请: {title[:60]}...")
-                        
-                    except Exception as e:
-                        print(f"  ⚠️ 解析邀请失败: {e}")
-            
+                raw_data = data.get("data")
+                if isinstance(raw_data, list):
+                    items = raw_data
+                elif isinstance(raw_data, dict):
+                    # 兼容新结构：data 下挂多个分组，值为 list
+                    if isinstance(raw_data.get("invitation"), list):
+                        items = raw_data.get("invitation", [])
+                    else:
+                        for v in raw_data.values():
+                            if isinstance(v, list):
+                                items = v
+                                break
+
+            print(f"📊 获取到 {len(items)} 个邀请")
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    # 提取问题信息
+                    question_data = item.get('question', {})
+                    if not isinstance(question_data, dict):
+                        continue
+                    if not question_data:
+                        continue
+                    
+                    question_id = str(question_data.get('id', ''))
+                    title = question_data.get('title', '')
+                    
+                    if not question_id or not title:
+                        continue
+                    
+                    # 检查是否已处理
+                    if question_id in self.processed_ids:
+                        print(f"  ⏭️  跳过已处理: {title[:50]}...")
+                        continue
+                    
+                    question = Question(
+                        id=question_id,
+                        title=title,
+                        url=f"https://www.zhihu.com/question/{question_id}",
+                        content=question_data.get('detail', '')[:1000]
+                    )
+                    
+                    invitation = Invitation(
+                        question=question,
+                        inviter=item.get('sender', {}).get('name') if isinstance(item.get('sender'), dict) else None
+                    )
+                    
+                    invitations.append(invitation)
+                    print(f"  📌 新邀请: {title[:60]}...")
+                    
+                except Exception as e:
+                    print(f"  ⚠️ 解析邀请失败: {e}")
+        
         except Exception as e:
             print(f"❌ 获取邀请失败: {e}")
         
         return invitations
-    
+
     def generate_answer(self, question: Question) -> str:
         """调用外部工具生成回答"""
         command_template = self.config.get('answer_generator', {}).get('command', '')

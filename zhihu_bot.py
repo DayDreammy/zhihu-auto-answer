@@ -37,14 +37,17 @@ except ImportError:
     QUESTION_CONTENT_SELECTORS = ['.QuestionRichText']
 
 
-# 配置日志
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# 配置日志（FileHandler 不会自动创建目录，因此必须提前 mkdir）
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/zhihu_bot.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(LOG_DIR / "zhihu_bot.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -74,9 +77,12 @@ class ZhihuAutoAnswer:
     
     def __init__(self, config_path: str = "config.yaml"):
         self.config = self._load_config(config_path)
+        self.playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self.use_persistent_profile = False
+        self.user_data_dir: Optional[Path] = None
         self.cookie_file = Path("zhihu_cookies.json")
         self.processed_file = Path("processed_invitations.json")
         self.processed_ids = self._load_processed_ids()
@@ -94,7 +100,7 @@ class ZhihuAutoAnswer:
         """加载已处理的邀请ID"""
         if self.processed_file.exists():
             try:
-                data = json.loads(self.processed_file.read_text())
+                data = json.loads(self.processed_file.read_text(encoding="utf-8"))
                 return set(data.get('processed_ids', []))
             except:
                 pass
@@ -110,7 +116,7 @@ class ZhihuAutoAnswer:
         except Exception as e:
             logger.error(f"保存处理记录失败: {e}")
     
-    async def init_browser(self, headless: bool = False):
+    async def init_browser(self, headless: bool = False, user_data_dir: Optional[str] = None):
         """初始化浏览器"""
         logger.info("正在初始化浏览器...")
         self.playwright = await async_playwright().start()
@@ -123,28 +129,45 @@ class ZhihuAutoAnswer:
                 '--disable-features=IsolateOrigins,site-per-process',
             ]
         }
-        
-        self.browser = await self.playwright.chromium.launch(**launch_args)
-        self.context = await self.browser.new_context(
-            viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            locale='zh-CN',
-            timezone_id='Asia/Shanghai',
-        )
-        
-        # 加载 Cookie
-        if self.cookie_file.exists():
-            try:
-                cookies = json.loads(self.cookie_file.read_text())
-                await self.context.add_cookies(cookies)
-                logger.info(f"已加载 {len(cookies)} 个 Cookie")
-            except Exception as e:
-                logger.warning(f"加载 Cookie 失败: {e}")
-        
-        self.page = await self.context.new_page()
-        
+        context_args = {
+            'viewport': {'width': 1920, 'height': 1080},
+            'user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'locale': 'zh-CN',
+            'timezone_id': 'Asia/Shanghai',
+        }
+
+        if user_data_dir:
+            self.use_persistent_profile = True
+            self.user_data_dir = Path(user_data_dir)
+            self.user_data_dir.mkdir(parents=True, exist_ok=True)
+            self.context = await self.playwright.chromium.launch_persistent_context(
+                user_data_dir=str(self.user_data_dir),
+                **launch_args,
+                **context_args,
+            )
+            self.browser = None
+            logger.info(f"使用持久化用户目录: {self.user_data_dir.resolve()}")
+        else:
+            self.use_persistent_profile = False
+            self.user_data_dir = None
+            self.browser = await self.playwright.chromium.launch(**launch_args)
+            self.context = await self.browser.new_context(**context_args)
+            
+            # 非持久化模式下，尝试加载 Cookie 文件
+            if self.cookie_file.exists():
+                try:
+                    cookies = json.loads(self.cookie_file.read_text(encoding="utf-8"))
+                    await self.context.add_cookies(cookies)
+                    logger.info(f"已加载 {len(cookies)} 个 Cookie")
+                except Exception as e:
+                    logger.warning(f"加载 Cookie 失败: {e}")
+
+        # 持久化上下文可能已有页面，优先复用
+        pages = self.context.pages
+        self.page = pages[0] if pages else await self.context.new_page()
+
         # 隐藏自动化特征
-        await self.page.add_init_script("""
+        await self.context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
             window.chrome = { runtime: {} };
@@ -156,10 +179,89 @@ class ZhihuAutoAnswer:
         """保存 Cookie"""
         try:
             cookies = await self.context.cookies()
-            self.cookie_file.write_text(json.dumps(cookies, indent=2))
-            logger.info(f"Cookie 已保存")
+            self.cookie_file.write_text(
+                json.dumps(cookies, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            if self.use_persistent_profile and self.user_data_dir:
+                logger.info(f"Cookie 已保存（持久化目录模式 + 备份文件 {self.cookie_file}）")
+            else:
+                logger.info("Cookie 已保存")
         except Exception as e:
             logger.error(f"保存 Cookie 失败: {e}")
+
+    async def _is_logged_in(self) -> bool:
+        """更稳健的登录判定：DOM 指示器 + API 校验（避免仅依赖单一 selector）。"""
+        if not self.page:
+            return False
+
+        # 1) DOM 指示器
+        for selector in LOGIN_INDICATORS:
+            try:
+                if await self.page.query_selector(selector):
+                    return True
+            except Exception:
+                continue
+
+        # 2) Cookie（扫码成功后通常会先写入 z_c0）
+        try:
+            cookies = await self.context.cookies("https://www.zhihu.com")
+            if any(c.get("name") == "z_c0" and c.get("value") for c in cookies):
+                return True
+        except Exception:
+            pass
+
+        # 3) API 校验（200 即认为登录成功）
+        try:
+            result = await self.page.evaluate(
+                """async () => {
+                    try {
+                        const resp = await fetch('https://www.zhihu.com/api/v4/me', {
+                            method: 'GET',
+                            credentials: 'include',
+                            headers: { 'Accept': 'application/json', 'X-Requested-With': 'fetch' }
+                        });
+                        return { ok: resp.ok, status: resp.status };
+                    } catch (e) {
+                        return { ok: false, error: String(e) };
+                    }
+                }"""
+            )
+            if isinstance(result, dict) and result.get("ok") and result.get("status") == 200:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    async def _wait_for_login(self, timeout_ms: int = 180000) -> bool:
+        """等待登录完成，并定期输出进度，避免“看起来卡住”。"""
+        start = time.monotonic()
+        last_log = 0.0
+
+        while (time.monotonic() - start) * 1000 < timeout_ms:
+            # 安全验证页提示
+            try:
+                url = self.page.url or ""
+                if "unhuman" in url or "/account" in url:
+                    if time.monotonic() - last_log > 5:
+                        logger.warning("检测到安全验证/风控页面，请在打开的浏览器窗口完成验证后等待程序继续...")
+                        last_log = time.monotonic()
+            except Exception:
+                pass
+
+            if await self._is_logged_in():
+                return True
+
+            # 每 5 秒打一条进度，避免用户以为无响应
+            if time.monotonic() - last_log > 5:
+                elapsed = int(time.monotonic() - start)
+                logger.info(f"等待扫码确认中... 已等待 {elapsed}s")
+                last_log = time.monotonic()
+
+            await asyncio.sleep(1)
+
+        return False
     
     async def check_login(self) -> bool:
         """检查是否已登录"""
@@ -167,13 +269,11 @@ class ZhihuAutoAnswer:
         try:
             await self.page.goto("https://www.zhihu.com", wait_until='networkidle')
             await self.page.wait_for_timeout(3000)
-            
-            for selector in LOGIN_INDICATORS:
-                elem = await self.page.query_selector(selector)
-                if elem:
-                    logger.info("✅ 已登录")
-                    return True
-            
+
+            if await self._is_logged_in():
+                logger.info("✅ 已登录")
+                return True
+
             logger.warning("❌ 未登录")
             return False
         except Exception as e:
@@ -193,17 +293,22 @@ class ZhihuAutoAnswer:
                 await self.page.wait_for_timeout(1000)
             
             await self.page.wait_for_selector('canvas, img[src*="qrcode"]', timeout=30000)
-            logger.info("请扫描二维码登录（2分钟内有效）...")
+            # 尽量把二维码保存为图片，便于在无头/远程场景扫码
+            try:
+                await self.page.screenshot(path="qrcode.png")
+                logger.info("二维码已保存到 qrcode.png（请用知乎 App 扫码并在手机端确认登录）")
+            except Exception:
+                logger.info("请扫描二维码登录（2分钟内有效）...")
         except:
             logger.warning("等待二维码失败，请手动操作")
-        
-        try:
-            await self.page.wait_for_selector('.AppHeader-profileEntryAvatar', timeout=120000)
-            logger.info("✅ 登录成功！")
-            await self.save_cookies()
-        except:
-            logger.error("❌ 登录超时")
-            raise
+
+        ok = await self._wait_for_login(timeout_ms=180000)
+        if not ok:
+            logger.error("❌ 登录超时（未检测到登录态）。可能原因：未在手机端确认、页面结构变更、或触发风控验证。")
+            raise TimeoutError("login timeout")
+
+        logger.info("✅ 登录成功！开始保存 Cookie...")
+        await self.save_cookies()
     
     async def _try_selectors(self, selectors: List[str], timeout: int = 5000) -> Optional[Any]:
         """尝试多个选择器，返回第一个成功的"""
@@ -225,6 +330,13 @@ class ZhihuAutoAnswer:
             # 访问通知页面
             await self.page.goto("https://www.zhihu.com/notifications", wait_until='networkidle')
             await self.page.wait_for_timeout(5000)
+
+            if "account/unhuman" in (self.page.url or ""):
+                logger.error(
+                    "通知页被重定向到安全验证页面（/account/unhuman）。"
+                    "请先在浏览器中完成验证后再重试。"
+                )
+                return []
             
             # 保存调试信息
             html = await self.page.content()
@@ -507,8 +619,18 @@ class ZhihuAutoAnswer:
     
     async def close(self):
         """关闭浏览器"""
-        if self.browser:
-            await self.browser.close()
-        if hasattr(self, 'playwright') and self.playwright:
+        try:
+            if self.context:
+                await self.context.close()
+        except Exception as e:
+            logger.warning(f"关闭 context 失败: {e}")
+
+        try:
+            if self.browser:
+                await self.browser.close()
+        except Exception as e:
+            logger.warning(f"关闭 browser 失败: {e}")
+
+        if self.playwright:
             await self.playwright.stop()
         logger.info("浏览器已关闭")
