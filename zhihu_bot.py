@@ -43,6 +43,10 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 ARTIFACT_DIR = Path("artifacts")
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+ANSWERS_BY_QID_DIR = ARTIFACT_DIR / "answers_by_qid"
+ANSWERS_BY_QID_DIR.mkdir(parents=True, exist_ok=True)
+RUNS_DIR = ARTIFACT_DIR / "runs"
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 配置日志（FileHandler 不会自动创建目录，因此必须提前 mkdir）
 logging.basicConfig(
@@ -422,26 +426,32 @@ class ZhihuAutoAnswer:
         logger.info(f"共发现 {len(invitations)} 个新邀请")
         return invitations
 
-    def _export_invitations(self, invitations: List[Invitation]) -> Path:
+    def _safe_write_json(self, path: Path, data: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _export_invitations(self, invitations: List[Invitation], extra_by_qid: Optional[Dict[str, Any]] = None) -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = ARTIFACT_DIR / f"invitations_{ts}.json"
         data = []
         for inv in invitations:
             q = inv.question
-            data.append(
-                {
-                    "id": q.id,
-                    "title": q.title,
-                    "url": q.url,
-                    "content": q.content,
-                    "inviter": inv.inviter,
-                    "invited_at": inv.invited_at,
-                }
-            )
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        (ARTIFACT_DIR / "invitations_latest.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+            item = {
+                "id": q.id,
+                "title": q.title,
+                "url": q.url,
+                "content": q.content,
+                "inviter": inv.inviter,
+                "invited_at": inv.invited_at,
+            }
+            if extra_by_qid and q.id in extra_by_qid:
+                item.update(extra_by_qid[q.id])
+            data.append(item)
+
+        self._safe_write_json(path, data)
+        self._safe_write_json(ARTIFACT_DIR / "invitations_latest.json", data)
         logger.info(f"邀请已导出: {path}")
         return path
 
@@ -485,6 +495,24 @@ class ZhihuAutoAnswer:
             "body": data,
             "text_prefix": text[:800],
         }
+
+    def _answer_artifact_path(self, question_id: str) -> Path:
+        safe = re.sub(r"[^0-9A-Za-z_-]+", "_", question_id or "")
+        return ANSWERS_BY_QID_DIR / f"{safe}.json"
+
+    def _load_answer_artifact(self, question_id: str) -> Optional[dict]:
+        path = self._answer_artifact_path(question_id)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _write_answer_artifact(self, question_id: str, data: dict) -> Path:
+        path = self._answer_artifact_path(question_id)
+        self._safe_write_json(path, data)
+        return path
 
     async def generate_answers_batch(self, invitations: List[Invitation]) -> Dict[str, str]:
         """
@@ -550,6 +578,180 @@ class ZhihuAutoAnswer:
             qid = item.get("question_id") or ""
             answers[qid] = (item.get("answer_text") or "").strip()
         return answers
+
+    async def process_invitations_deep_research_incremental(
+        self,
+        invitations: List[Invitation],
+        *,
+        flush_drafts_every: int = 5,
+    ) -> dict:
+        """
+        deep_research 增量模式：
+        - deep_research 成功一个就立刻落盘（answers_by_qid/{qid}.json）并更新 invitations_latest.json
+        - 草稿箱写入按批处理（默认每 5 个写入一次）
+        - 重跑时如果 answers_by_qid 里已有成功结果，会跳过 deep_research，直接进入草稿写入阶段
+        """
+        cfg = self._get_deep_research_config()
+        if not cfg:
+            raise RuntimeError("deep_research config not enabled")
+
+        endpoint = (cfg.get("endpoint") or "").strip()
+        if not endpoint:
+            raise RuntimeError("missing deep_research endpoint in config: answer_generator.deep_research.endpoint")
+
+        token = self._deep_research_token(cfg)
+        timeout_s = int(cfg.get("timeout_seconds") or 650)
+        concurrency = max(1, int(cfg.get("concurrency") or 2))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        state_by_qid: Dict[str, Any] = {}
+        answers_map: Dict[str, str] = {}
+        pending_drafts: List[str] = []
+        failures: List[dict] = []
+        initial_processed = set(self.processed_ids)
+
+        # 预加载已有回答产物（用于 resume）
+        for inv in invitations:
+            q = inv.question
+            artifact = self._load_answer_artifact(q.id)
+            if isinstance(artifact, dict) and artifact.get("ok") and (artifact.get("answer_text") or "").strip():
+                answers_map[q.id] = (artifact.get("answer_text") or "").strip()
+                state_by_qid[q.id] = {
+                    "answer_ok": True,
+                    "answer_status": artifact.get("status"),
+                    "answer_artifact": str(self._answer_artifact_path(q.id).as_posix()),
+                    "answer_len": len(answers_map[q.id]),
+                    "answer_generated_at": artifact.get("generated_at"),
+                    "draft_saved": q.id in self.processed_ids,
+                }
+                if q.id not in self.processed_ids:
+                    pending_drafts.append(q.id)
+            else:
+                state_by_qid[q.id] = {
+                    "answer_ok": False,
+                    "draft_saved": q.id in self.processed_ids,
+                }
+
+        # 初始导出（包含当前状态）
+        self._export_invitations(invitations, extra_by_qid=state_by_qid)
+
+        async def _save_batch(qids: List[str]) -> None:
+            for qid in qids:
+                inv = next((x for x in invitations if x.question.id == qid), None)
+                if not inv:
+                    continue
+                if qid in self.processed_ids:
+                    state_by_qid[qid]["draft_saved"] = True
+                    continue
+                answer = (answers_map.get(qid) or "").strip()
+                if not answer:
+                    continue
+                try:
+                    ok = await self.save_answer_to_draft(inv.question, answer)
+                except Exception as e:
+                    ok = False
+                    failures.append(
+                        {
+                            "question_id": qid,
+                            "title": inv.question.title,
+                            "stage": "save_draft",
+                            "error": str(e),
+                        }
+                    )
+                state_by_qid[qid]["draft_saved"] = bool(ok)
+                state_by_qid[qid]["draft_saved_at"] = datetime.now().isoformat()
+                if ok:
+                    self.processed_ids.add(qid)
+                    self._save_processed_ids()
+                # 每次写入草稿后也更新 invitations_latest，方便 resume/观察进度
+                self._export_invitations(invitations, extra_by_qid=state_by_qid)
+
+        # 先把“已有回答但未写草稿”的补写（按 flush_drafts_every 批量）
+        while len(pending_drafts) >= flush_drafts_every:
+            batch = pending_drafts[:flush_drafts_every]
+            pending_drafts = pending_drafts[flush_drafts_every:]
+            await _save_batch(batch)
+
+        # 生成缺失的回答（增量落盘）
+        to_generate = [inv for inv in invitations if inv.question.id not in self.processed_ids and inv.question.id not in answers_map]
+        logger.info(
+            f"deep_research 增量生成开始: total={len(invitations)} to_generate={len(to_generate)} "
+            f"already_answered={len(answers_map)} concurrency={concurrency}"
+        )
+
+        async def _run_one(inv: Invitation) -> dict:
+            q = inv.question
+            async with semaphore:
+                r = await self._deep_research_one(endpoint, token, q.title, q.content or "", timeout_s)
+
+            body = r.get("body")
+            answer_text = ""
+            if isinstance(body, dict):
+                answer_text = (body.get("text_report") or "").strip()
+
+            artifact = {
+                "question_id": q.id,
+                "title": q.title,
+                "url": q.url,
+                "generated_at": datetime.now().isoformat(),
+                "ok": bool(r.get("ok")) and bool(answer_text),
+                "status": r.get("status"),
+                "answer_text": answer_text,
+                "raw": body if isinstance(body, dict) else None,
+                "text_prefix": r.get("text_prefix"),
+            }
+            self._write_answer_artifact(q.id, artifact)
+
+            # 更新内存状态 + 立刻导出 invitations_latest（用户要求“成功一个就落盘并更新问题json”）
+            if artifact["ok"]:
+                answers_map[q.id] = answer_text
+                pending_drafts.append(q.id)
+            else:
+                failures.append(
+                    {
+                        "question_id": q.id,
+                        "title": q.title,
+                        "stage": "deep_research",
+                        "status": artifact.get("status"),
+                        "text_prefix": artifact.get("text_prefix"),
+                    }
+                )
+
+            state_by_qid[q.id] = {
+                "answer_ok": artifact["ok"],
+                "answer_status": artifact.get("status"),
+                "answer_artifact": str(self._answer_artifact_path(q.id).as_posix()),
+                "answer_len": len(answer_text),
+                "answer_generated_at": artifact.get("generated_at"),
+                "draft_saved": q.id in self.processed_ids,
+            }
+            self._export_invitations(invitations, extra_by_qid=state_by_qid)
+            return artifact
+
+        tasks = [asyncio.create_task(_run_one(inv)) for inv in to_generate]
+        for fut in asyncio.as_completed(tasks):
+            _ = await fut
+
+            # 每生成 flush_drafts_every 个成功回答，就批量写一次草稿箱
+            while len(pending_drafts) >= flush_drafts_every:
+                batch = pending_drafts[:flush_drafts_every]
+                pending_drafts = pending_drafts[flush_drafts_every:]
+                await _save_batch(batch)
+
+        # flush 剩余
+        if pending_drafts:
+            await _save_batch(pending_drafts)
+
+        new_processed = sorted(self.processed_ids - initial_processed)
+        return {
+            "mode": "deep_research_incremental",
+            "total": len(invitations),
+            "draft_saved_ok": len(new_processed),
+            "draft_saved_ok_ids": new_processed,
+            "failures": failures,
+            "answers_by_qid_dir": str(ANSWERS_BY_QID_DIR.as_posix()),
+            "invitations_latest": str((ARTIFACT_DIR / "invitations_latest.json").as_posix()),
+        }
     
     async def get_question_detail(self, question: Question) -> str:
         """获取问题详情"""
@@ -777,15 +979,24 @@ class ZhihuAutoAnswer:
             logger.error(traceback.format_exc())
             return False
     
+    def _get_feishu_webhook(self) -> str:
+        webhook = (self.config.get("notification", {}) or {}).get("feishu_webhook", "") or ""
+        webhook = webhook.strip()
+        if webhook:
+            return webhook
+        return (os.environ.get("FEISHU_WEBHOOK_URL", "") or "").strip()
+
     async def send_notification(self, message: str):
-        """发送通知"""
-        webhook = self.config.get('notification', {}).get('feishu_webhook', '')
+        """发送通知（飞书）"""
+        webhook = self._get_feishu_webhook()
         if not webhook:
-            logger.info("未配置飞书 webhook")
+            logger.info("未配置飞书 webhook（config.yaml notification.feishu_webhook 或 env FEISHU_WEBHOOK_URL）")
             return
         
         try:
             import requests
+            if "yy" not in message:
+                message = "yy\n" + message
             response = requests.post(webhook, json={
                 "msg_type": "text",
                 "content": {"text": message}
@@ -798,16 +1009,49 @@ class ZhihuAutoAnswer:
         except Exception as e:
             logger.error(f"发送通知失败: {e}")
     
-    async def process_invitations(self):
-        """处理所有邀请"""
+    async def process_invitations(self, *, max_questions: Optional[int] = None, flush_drafts_every: int = 5) -> dict:
+        """处理所有邀请，返回 summary（用于通知/定时任务）。"""
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        started_at = datetime.now().isoformat()
         invitations = await self.get_invitations()
         
         if not invitations:
             logger.info("📭 没有新的邀请")
-            return
+            summary = {
+                "run_id": run_id,
+                "started_at": started_at,
+                "ended_at": datetime.now().isoformat(),
+                "selected": 0,
+                "draft_saved_ok": 0,
+                "failures": [],
+                "mode": "none",
+            }
+            self._safe_write_json(RUNS_DIR / f"run_{run_id}.json", summary)
+            self._safe_write_json(RUNS_DIR / "run_latest.json", summary)
+            return summary
 
         processed = []
         failed = []
+
+        # 0) 过滤已处理（草稿已保存）的邀请
+        invitations = [inv for inv in invitations if inv.question.id not in self.processed_ids]
+        if not invitations:
+            logger.info("📭 没有新的邀请（都已处理过）")
+            summary = {
+                "run_id": run_id,
+                "started_at": started_at,
+                "ended_at": datetime.now().isoformat(),
+                "selected": 0,
+                "draft_saved_ok": 0,
+                "failures": [],
+                "mode": "none",
+            }
+            self._safe_write_json(RUNS_DIR / f"run_{run_id}.json", summary)
+            self._safe_write_json(RUNS_DIR / "run_latest.json", summary)
+            return summary
+
+        if isinstance(max_questions, int) and max_questions > 0:
+            invitations = invitations[:max_questions]
 
         # 1) 获取每个问题的详情（用于回答生成的 context）
         for i, inv in enumerate(invitations, 1):
@@ -815,13 +1059,30 @@ class ZhihuAutoAnswer:
             await self.get_question_detail(inv.question)
             await asyncio.sleep(1)
 
-        # 2) 导出邀请 JSON
-        self._export_invitations(invitations)
+        # 2) deep_research 模式走“增量生成 + 批量写草稿”
+        if self._get_deep_research_config():
+            dr_summary = await self.process_invitations_deep_research_incremental(
+                invitations, flush_drafts_every=flush_drafts_every
+            )
+            summary = {
+                "run_id": run_id,
+                "started_at": started_at,
+                "ended_at": datetime.now().isoformat(),
+                "selected": len(invitations),
+                "draft_saved_ok": dr_summary.get("draft_saved_ok", 0),
+                "failures": dr_summary.get("failures", []),
+                "mode": dr_summary.get("mode"),
+                "artifacts": {
+                    "invitations_latest": dr_summary.get("invitations_latest"),
+                    "answers_by_qid_dir": dr_summary.get("answers_by_qid_dir"),
+                },
+            }
+            self._safe_write_json(RUNS_DIR / f"run_{run_id}.json", summary)
+            self._safe_write_json(RUNS_DIR / "run_latest.json", summary)
+            return summary
 
-        # 3) 批量生成回答（deep_research 或 legacy）
+        # 3) legacy：批量生成回答（command）后逐个写入
         answers_map = await self.generate_answers_batch(invitations)
-
-        # 4) 逐个写入草稿箱
         for i, invitation in enumerate(invitations, 1):
             logger.info(f"\n处理第 {i}/{len(invitations)} 个邀请...")
             try:
@@ -834,9 +1095,7 @@ class ZhihuAutoAnswer:
                 success = await self.save_answer_to_draft(invitation.question, answer)
 
                 if success:
-                    processed.append(
-                        {"title": invitation.question.title, "url": invitation.question.url}
-                    )
+                    processed.append({"title": invitation.question.title, "url": invitation.question.url})
                     self.processed_ids.add(invitation.question.id)
                     self._save_processed_ids()
                 else:
@@ -847,22 +1106,19 @@ class ZhihuAutoAnswer:
             except Exception as e:
                 logger.error(f"处理邀请失败: {e}")
                 failed.append(invitation.question.title)
-        
-        # 发送通知
-        if processed or failed:
-            message = f"🤖 知乎自动回答机器人\n\n"
-            message += f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-            
-            if processed:
-                message += f"✅ 成功 {len(processed)} 个:\n"
-                for item in processed:
-                    message += f"\n📌 {item['title'][:50]}...\n"
-                message += "\n请登录知乎查看草稿箱。\n"
-            
-            if failed:
-                message += f"\n❌ 失败 {len(failed)} 个\n"
-            
-            await self.send_notification(message)
+
+        summary = {
+            "run_id": run_id,
+            "started_at": started_at,
+            "ended_at": datetime.now().isoformat(),
+            "selected": len(invitations),
+            "draft_saved_ok": len(processed),
+            "failures": [{"title": t, "stage": "legacy"} for t in failed],
+            "mode": "command",
+        }
+        self._safe_write_json(RUNS_DIR / f"run_{run_id}.json", summary)
+        self._safe_write_json(RUNS_DIR / "run_latest.json", summary)
+        return summary
     
     async def close(self):
         """关闭浏览器"""

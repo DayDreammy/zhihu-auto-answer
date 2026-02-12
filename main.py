@@ -55,6 +55,14 @@ async def main():
     parser.add_argument('--login', action='store_true', help='扫码登录并保存Cookie')
     parser.add_argument('--config', default='config.yaml', help='配置文件路径')
     parser.add_argument('--headless', action='store_true', help='无界面模式（用于定时任务）')
+    parser.add_argument('--max-questions', type=int, default=10, help='每次最多处理多少个问题（默认10）')
+    parser.add_argument(
+        '--answer-type',
+        choices=['command', 'deep_research'],
+        default=None,
+        help='回答生成方式（覆盖 config.yaml answer_generator.type）',
+    )
+    parser.add_argument('--flush-drafts-every', type=int, default=5, help='每累计多少个回答写入一次草稿箱（deep_research模式）')
     parser.add_argument(
         '--user-data-dir',
         default='.playwright-profile/zhihu',
@@ -70,6 +78,11 @@ async def main():
     bot = ZhihuAutoAnswer(config_path=args.config)
     
     try:
+        # 允许 CLI 覆盖回答生成方式
+        if args.answer_type:
+            bot.config.setdefault('answer_generator', {})
+            bot.config['answer_generator']['type'] = args.answer_type
+
         # 初始化浏览器
         user_data_dir = None if args.no_persistent_profile else args.user_data_dir
         await bot.init_browser(headless=args.headless, user_data_dir=user_data_dir)
@@ -85,10 +98,63 @@ async def main():
         # 检查登录状态
         if not await bot.check_login():
             print("\n❌ 未登录，请先运行: python main.py --login")
+            # 仍然发送通知，避免定时任务“静默失败”
+            summary = {
+                "run_id": "not_logged_in",
+                "started_at": "",
+                "ended_at": "",
+                "mode": "not_logged_in",
+                "selected": 0,
+                "draft_saved_ok": 0,
+                "failures": [{"stage": "check_login", "title": "not_logged_in"}],
+                "artifacts": {},
+            }
+            try:
+                await bot.send_notification("🤖 知乎自动回答机器人\n\n未登录：请先运行 python main.py --login\n")
+            except Exception:
+                pass
             return
         
-        # 处理邀请
-        await bot.process_invitations()
+        # 处理邀请（返回 summary）
+        summary = await bot.process_invitations(
+            max_questions=args.max_questions,
+            flush_drafts_every=args.flush_drafts_every,
+        )
+
+        # 无论成功失败，都发一条相对详细的通知
+        try:
+            # log tail
+            log_path = Path("logs") / "zhihu_bot.log"
+            tail = ""
+            if log_path.exists():
+                try:
+                    tail_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]
+                    tail = "\n".join(tail_lines)
+                except Exception:
+                    tail = ""
+
+            msg = []
+            msg.append("🤖 知乎自动回答机器人")
+            msg.append(f"⏰ run_id={summary.get('run_id')} started={summary.get('started_at')} ended={summary.get('ended_at')}")
+            msg.append(f"mode={summary.get('mode')} selected={summary.get('selected')} draft_saved_ok={summary.get('draft_saved_ok')}")
+            fails = summary.get("failures") or []
+            msg.append(f"failures={len(fails)}")
+            if fails:
+                msg.append("失败明细(最多10条):")
+                for item in fails[:10]:
+                    title = item.get("title") or ""
+                    stage = item.get("stage") or ""
+                    status = item.get("status")
+                    msg.append(f"- [{stage}] {title[:60]} status={status}")
+            art = summary.get("artifacts") or {}
+            if art:
+                msg.append(f"artifacts: {art}")
+            if tail:
+                msg.append("\nlog_tail:\n" + tail)
+
+            await bot.send_notification("\n".join(msg))
+        except Exception:
+            pass
         
     except KeyboardInterrupt:
         print("\n\n👋 程序已停止")
@@ -96,6 +162,10 @@ async def main():
         print(f"\n❌ 错误: {e}")
         import traceback
         traceback.print_exc()
+        try:
+            await bot.send_notification(f"🤖 知乎自动回答机器人\n\n运行异常: {type(e).__name__}: {e}\n")
+        except Exception:
+            pass
     finally:
         await bot.close()
 
