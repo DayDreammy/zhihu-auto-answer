@@ -19,6 +19,17 @@ qrcode.png
 
 # 调试文件
 debug_*.html
+debug_*.json
+
+# Playwright 持久化目录/产物（包含登录态，禁止提交）
+.playwright-profile/
+.playwright-profile.zip
+
+# 运行产物（接口请求/回答导出等）
+artifacts/
+
+# Secrets
+.env
 
 # IDE
 .vscode/

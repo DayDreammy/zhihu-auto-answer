@@ -9,6 +9,20 @@ check:
   
 # 外部回答生成工具配置
 answer_generator:
+  # 生成方式：
+  # - deep_research: 调用 deep_research API（推荐，用于本项目默认联调流程）
+  # - command: 调用本地命令（旧模式）
+  #
+  # type: deep_research
+  type: command
+
+  # deep_research API 配置（token 建议放到环境变量 CABINET_API_TOKEN 或 .env）
+  deep_research:
+    endpoint: "http://47.99.121.125:9026/api/deep_research"
+    token_env: "CABINET_API_TOKEN"
+    timeout_seconds: 650
+    concurrency: 2
+
   # 配置你的回答生成工具命令
   # 可用占位符:
   #   {title}   - 问题标题

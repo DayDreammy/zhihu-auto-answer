@@ -7,6 +7,14 @@ import argparse
 import sys
 from pathlib import Path
 
+# Optional: load secrets (e.g. CABINET_API_TOKEN) from .env
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 # Avoid UnicodeEncodeError on Windows consoles (cp936/gbk) when logs contain non-ASCII.
 if hasattr(sys.stdout, "reconfigure"):
     try:

@@ -5,6 +5,7 @@
 """
 import asyncio
 import json
+import os
 import re
 import time
 import logging
@@ -39,6 +40,9 @@ except ImportError:
 
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+ARTIFACT_DIR = Path("artifacts")
+ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 配置日志（FileHandler 不会自动创建目录，因此必须提前 mkdir）
 logging.basicConfig(
@@ -324,7 +328,7 @@ class ZhihuAutoAnswer:
     async def get_invitations(self) -> List[Invitation]:
         """获取邀请回答列表"""
         logger.info("正在获取邀请列表...")
-        invitations = []
+        invitations: List[Invitation] = []
         
         try:
             # 访问通知页面
@@ -353,7 +357,9 @@ class ZhihuAutoAnswer:
             if not items:
                 logger.warning("未找到任何通知，可能是页面结构变化")
                 return []
-            
+
+            # 页面上同一个邀请可能出现多次（比如两列/重复渲染），这里做去重
+            seen_qids: set[str] = set()
             for item in items:
                 try:
                     text = await item.text_content() or ""
@@ -386,6 +392,10 @@ class ZhihuAutoAnswer:
                         continue
                     
                     question_id = match.group(1)
+
+                    if question_id in seen_qids:
+                        continue
+                    seen_qids.add(question_id)
                     
                     # 检查是否已处理
                     if question_id in self.processed_ids:
@@ -411,6 +421,135 @@ class ZhihuAutoAnswer:
         
         logger.info(f"共发现 {len(invitations)} 个新邀请")
         return invitations
+
+    def _export_invitations(self, invitations: List[Invitation]) -> Path:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = ARTIFACT_DIR / f"invitations_{ts}.json"
+        data = []
+        for inv in invitations:
+            q = inv.question
+            data.append(
+                {
+                    "id": q.id,
+                    "title": q.title,
+                    "url": q.url,
+                    "content": q.content,
+                    "inviter": inv.inviter,
+                    "invited_at": inv.invited_at,
+                }
+            )
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        (ARTIFACT_DIR / "invitations_latest.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        logger.info(f"邀请已导出: {path}")
+        return path
+
+    def _get_deep_research_config(self) -> Optional[dict]:
+        ag = self.config.get("answer_generator", {}) or {}
+        ag_type = (ag.get("type") or "command").strip().lower()
+        if ag_type != "deep_research":
+            return None
+        cfg = ag.get("deep_research", {}) or {}
+        return cfg
+
+    def _deep_research_token(self, cfg: dict) -> str:
+        token_env = (cfg.get("token_env") or "CABINET_API_TOKEN").strip()
+        token = os.environ.get(token_env, "").strip()
+        if token:
+            return token
+        # allow explicit token in config (not recommended)
+        token = (cfg.get("token") or "").strip()
+        if token:
+            return token
+        raise RuntimeError(f"missing deep_research token: set env {token_env} (recommended) or answer_generator.deep_research.token")
+
+    async def _deep_research_one(self, endpoint: str, token: str, title: str, content: str, timeout_s: int) -> dict:
+        import requests
+
+        payload = {"query": title, "context": content or "", "token": token}
+
+        def _call():
+            return requests.post(endpoint, json=payload, timeout=timeout_s)
+
+        resp = await asyncio.to_thread(_call)
+        text = resp.text
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+
+        return {
+            "ok": resp.status_code == 200,
+            "status": resp.status_code,
+            "body": data,
+            "text_prefix": text[:800],
+        }
+
+    async def generate_answers_batch(self, invitations: List[Invitation]) -> Dict[str, str]:
+        """
+        批量生成回答。
+        返回：question_id -> answer_text
+        同时会输出 artifacts/answers_*.json 和 answers_latest.json
+        """
+        cfg = self._get_deep_research_config()
+        if not cfg:
+            # fallback: sequential legacy generation
+            answers: Dict[str, str] = {}
+            for inv in invitations:
+                ans = await self.generate_answer(inv.question)
+                answers[inv.question.id] = ans
+            return answers
+
+        endpoint = (cfg.get("endpoint") or "").strip()
+        if not endpoint:
+            raise RuntimeError("missing deep_research endpoint in config: answer_generator.deep_research.endpoint")
+
+        token = self._deep_research_token(cfg)
+        timeout_s = int(cfg.get("timeout_seconds") or 650)
+        concurrency = int(cfg.get("concurrency") or 2)
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = ARTIFACT_DIR / f"answers_{ts}.json"
+
+        logger.info(f"开始批量生成回答: n={len(invitations)} concurrency={concurrency} timeout_s={timeout_s}")
+
+        results = []
+
+        async def _run_one(inv: Invitation):
+            q = inv.question
+            async with semaphore:
+                r = await self._deep_research_one(endpoint, token, q.title, q.content or "", timeout_s)
+            body = r.get("body")
+            # 默认取 text_report 作为回答正文
+            answer_text = ""
+            if isinstance(body, dict):
+                answer_text = (body.get("text_report") or "").strip()
+            return {
+                "question_id": q.id,
+                "title": q.title,
+                "url": q.url,
+                "ok": r.get("ok"),
+                "status": r.get("status"),
+                "answer_text": answer_text,
+                "raw": body if isinstance(body, dict) else None,
+                "text_prefix": r.get("text_prefix"),
+            }
+
+        results = await asyncio.gather(*[_run_one(inv) for inv in invitations])
+
+        out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        (ARTIFACT_DIR / "answers_latest.json").write_text(
+            json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        logger.info(f"回答已导出: {out_path}")
+
+        answers: Dict[str, str] = {}
+        for item in results:
+            qid = item.get("question_id") or ""
+            answers[qid] = (item.get("answer_text") or "").strip()
+        return answers
     
     async def get_question_detail(self, question: Question) -> str:
         """获取问题详情"""
@@ -666,38 +805,45 @@ class ZhihuAutoAnswer:
         if not invitations:
             logger.info("📭 没有新的邀请")
             return
-        
+
         processed = []
         failed = []
-        
-        for i, invitation in enumerate(invitations):
-            logger.info(f"\n处理第 {i+1}/{len(invitations)} 个邀请...")
-            
+
+        # 1) 获取每个问题的详情（用于回答生成的 context）
+        for i, inv in enumerate(invitations, 1):
+            logger.info(f"获取详情 {i}/{len(invitations)}: {inv.question.title[:60]}...")
+            await self.get_question_detail(inv.question)
+            await asyncio.sleep(1)
+
+        # 2) 导出邀请 JSON
+        self._export_invitations(invitations)
+
+        # 3) 批量生成回答（deep_research 或 legacy）
+        answers_map = await self.generate_answers_batch(invitations)
+
+        # 4) 逐个写入草稿箱
+        for i, invitation in enumerate(invitations, 1):
+            logger.info(f"\n处理第 {i}/{len(invitations)} 个邀请...")
             try:
-                # 获取问题详情
-                await self.get_question_detail(invitation.question)
-                
-                # 生成回答
-                answer = await self.generate_answer(invitation.question)
+                answer = (answers_map.get(invitation.question.id) or "").strip()
                 if not answer:
                     failed.append(invitation.question.title)
+                    logger.error("回答为空，跳过保存草稿")
                     continue
-                
-                # 保存到草稿
+
                 success = await self.save_answer_to_draft(invitation.question, answer)
-                
+
                 if success:
-                    processed.append({
-                        'title': invitation.question.title,
-                        'url': invitation.question.url
-                    })
+                    processed.append(
+                        {"title": invitation.question.title, "url": invitation.question.url}
+                    )
                     self.processed_ids.add(invitation.question.id)
                     self._save_processed_ids()
                 else:
                     failed.append(invitation.question.title)
-                
-                await asyncio.sleep(10)
-                
+
+                await asyncio.sleep(5)
+
             except Exception as e:
                 logger.error(f"处理邀请失败: {e}")
                 failed.append(invitation.question.title)
