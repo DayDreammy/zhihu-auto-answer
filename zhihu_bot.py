@@ -484,36 +484,137 @@ class ZhihuAutoAnswer:
                     logger.info(f"找到写回答按钮: {selector}")
                     break
             
+            write_url = f"https://www.zhihu.com/question/{question.id}/write"
+            opened_write_page = False
             if write_btn:
-                await write_btn.click()
-                await self.page.wait_for_timeout(3000)
-            else:
-                # 直接访问写回答页面
-                write_url = f"https://www.zhihu.com/question/{question.id}/write"
+                try:
+                    await write_btn.scroll_into_view_if_needed()
+                    await self.page.wait_for_timeout(200)
+                    await write_btn.click(timeout=5000)
+                    await self.page.wait_for_timeout(1500)
+                    opened_write_page = "/write" in (self.page.url or "")
+                except Exception as e:
+                    logger.warning(f"点击写回答按钮失败，改用直达写回答页: {e}")
+
+            # 按钮点击可能被顶部 header 遮挡，统一降级到直达 /write 页面
+            if not opened_write_page:
                 await self.page.goto(write_url, wait_until='networkidle')
                 await self.page.wait_for_timeout(3000)
             
-            # 查找编辑器
+            # 查找编辑器（使用 visible wait，避免拿到不可编辑容器）
             editor = None
-            for selector in EDITOR_SELECTORS:
-                editor = await self.page.query_selector(selector)
+            used_selector = None
+            selector_candidates = list(EDITOR_SELECTORS) + [
+                ".ProseMirror",
+                ".RichText.ztext",
+                "[class*='RichText'] [contenteditable='true']",
+            ]
+            for selector in selector_candidates:
+                try:
+                    editor = await self.page.wait_for_selector(
+                        selector, timeout=3000, state="visible"
+                    )
+                except Exception:
+                    editor = None
                 if editor:
+                    used_selector = selector
                     logger.info(f"找到编辑器: {selector}")
                     break
             
             if not editor:
+                await self.page.screenshot(path="debug_editor_not_found.png", full_page=True)
                 logger.error("未找到编辑器")
                 return False
             
-            # 输入回答
+            # 输入回答：fill -> keyboard -> JS 注入，多策略保证兼容 contenteditable 编辑器
             await editor.click()
-            await self.page.wait_for_timeout(500)
-            await self.page.keyboard.press('Control+a')
-            await self.page.wait_for_timeout(200)
-            await self.page.keyboard.press('Delete')
-            await self.page.wait_for_timeout(200)
-            await editor.fill(answer)
-            await self.page.wait_for_timeout(3000)
+            await self.page.wait_for_timeout(300)
+
+            input_ok = False
+            # 1) 优先尝试 fill（适用于 textarea/input 或部分可编辑元素）
+            try:
+                await editor.fill(answer)
+                input_ok = True
+                logger.info("编辑器填充成功: fill")
+            except Exception:
+                logger.info("fill 不适用，切换到键盘输入")
+
+            # 2) 键盘输入（更通用）
+            if not input_ok:
+                try:
+                    await self.page.keyboard.press("Control+a")
+                    await self.page.wait_for_timeout(150)
+                    await self.page.keyboard.press("Backspace")
+                    await self.page.wait_for_timeout(150)
+                    await self.page.keyboard.insert_text(answer)
+                    input_ok = True
+                    logger.info("编辑器填充成功: keyboard.insert_text")
+                except Exception as e:
+                    logger.warning(f"键盘输入失败: {e}")
+
+            # 3) JS 注入（兜底）
+            if not input_ok:
+                try:
+                    await editor.evaluate(
+                        """(el, text) => {
+                            const target =
+                                el.matches('textarea, input, [contenteditable=\"true\"]')
+                                    ? el
+                                    : el.querySelector('textarea, input, [contenteditable=\"true\"]');
+                            if (!target) throw new Error('no editable target');
+
+                            if ('value' in target) {
+                                target.focus();
+                                target.value = text;
+                                target.dispatchEvent(new Event('input', { bubbles: true }));
+                                target.dispatchEvent(new Event('change', { bubbles: true }));
+                            } else {
+                                target.focus();
+                                const sel = window.getSelection();
+                                const range = document.createRange();
+                                range.selectNodeContents(target);
+                                sel.removeAllRanges();
+                                sel.addRange(range);
+                                document.execCommand('delete');
+                                document.execCommand('insertText', false, text);
+                                target.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+                            }
+                        }""",
+                        answer,
+                    )
+                    input_ok = True
+                    logger.info("编辑器填充成功: js fallback")
+                except Exception as e:
+                    logger.error(f"JS 注入失败: {e}")
+
+            if not input_ok:
+                await self.page.screenshot(path="debug_editor_input_failed.png", full_page=True)
+                logger.error(f"编辑器输入失败，selector={used_selector}")
+                return False
+
+            # 校验是否真的写入了文本
+            text_len = 0
+            try:
+                text_len = await editor.evaluate(
+                    """(el) => {
+                        const target =
+                            el.matches('textarea, input, [contenteditable=\"true\"]')
+                                ? el
+                                : el.querySelector('textarea, input, [contenteditable=\"true\"]');
+                        if (!target) return 0;
+                        const val = ('value' in target) ? target.value : (target.innerText || target.textContent || '');
+                        return (val || '').trim().length;
+                    }"""
+                )
+            except Exception:
+                pass
+            logger.info(f"编辑器文本长度: {text_len}")
+            if text_len == 0:
+                await self.page.screenshot(path="debug_editor_text_empty.png", full_page=True)
+                logger.error("编辑器内容为空，判定写入失败")
+                return False
+
+            await self.page.wait_for_timeout(2000)
             
             # 保存草稿
             for selector in SAVE_DRAFT_BUTTONS:
