@@ -35,6 +35,11 @@ $args = @(
 
 "[$(Get-Date -Format o)] starting: python $($args -join ' ')" | Out-File -FilePath $outLog -Encoding utf8
 
-& python @args *>> $outLog
+# NOTE:
+# When Python/Playwright writes anything to stderr, Windows PowerShell turns it into a non-terminating
+# error record. With $ErrorActionPreference="Stop" this aborts the script and the scheduled task exits 1
+# even though the Python process may still be running. Use cmd.exe to capture stdout+stderr reliably.
+$quotedArgs = $args | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }
+$cmdLine = 'python ' + ($quotedArgs -join ' ') + ' >> "' + $outLog + '" 2>&1'
+cmd /c $cmdLine
 exit $LASTEXITCODE
-
