@@ -20,5 +20,15 @@ schtasks.exe /Create /F `
   /RL LIMITED `
   /TR $tr | Out-Host
 
-schtasks.exe /Query /TN $TaskName /V /FO LIST | Out-Host
+# Allow running on battery (default Task Scheduler settings may queue forever on laptops).
+try {
+  $task = Get-ScheduledTask -TaskName $TaskName
+  $settings = $task.Settings
+  $settings.DisallowStartIfOnBatteries = $false
+  $settings.StopIfGoingOnBatteries = $false
+  Set-ScheduledTask -TaskName $TaskName -Settings $settings | Out-Null
+} catch {
+  Write-Warning "Unable to update battery settings for task $TaskName: $($_.Exception.Message)"
+}
 
+schtasks.exe /Query /TN $TaskName /V /FO LIST | Out-Host
