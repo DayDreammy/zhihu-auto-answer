@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zhihu Auto Answer"
+  short_description: "Automate Zhihu invitation triage and draft answering"
+  default_prompt: "Use $zhihu-auto-answer to log in, fetch invitations, generate answers, and save drafts safely."

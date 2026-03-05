@@ -20,6 +20,9 @@ qrcode.png
 # 调试文件
 debug_*.html
 debug_*.json
+zhihu_*.html
+zhihu_*.png
+*.trace.json
 
 # Playwright 持久化目录/产物（包含登录态，禁止提交）
 .playwright-profile/
@@ -30,6 +33,7 @@ artifacts/
 
 # Secrets
 .env
+.env.local
 
 # IDE
 .vscode/
